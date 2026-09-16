@@ -1,0 +1,246 @@
+import json
+from pathlib import Path
+import sys
+import time
+import types
+import sqlite3
+import threading
+import urllib.request
+import urllib.error
+import pytest
+from app.extractor import extract, validate_event, received_time
+from app.service import App
+from app.__main__ import serve
+
+# Synthetic notice: preserves date, multi-stage and recruitment-year cases.
+NOTICE = '''同学们：
+明日重要招聘宣讲活动预告如下：
+📢📢📢宣讲会
+9月16日（周三）
+时间：9:30-11:30
+地点：示例校区103教学楼106教室
+单位：示例机关及其直属机构2027年度公务员招录宣讲会
+9月16日（周三）：
+示例研究院人才宣讲招聘会
+宣讲会时间：15:00--16:00
+宣讲会地点：示例校区103教学楼104教室
+双选会时间：16:00--17:30
+双选会地点：示例校区103教学楼103教室
+9月16日（周三）
+时间：19:00-20:30
+地点：示例校区103教学楼102教室
+单位：示例科技股份有限公司
+请参加的同学们携带好简历！
+就业办:示例老师，电话:00000000。'''
+
+
+def test_notice_splits_four_events_and_preserves_recruitment_year():
+    result = extract(NOTICE, '2026-09-15T22:00:00+08:00')
+    assert len(result['events']) == 4
+    assert [e['location'] for e in result['events']] == ['示例校区103教学楼106教室', '示例校区103教学楼104教室', '示例校区103教学楼103教室', '示例校区103教学楼102教室']
+    assert [e['start'][11:16] for e in result['events']] == ['09:30', '15:00', '16:00', '19:00']
+    assert all(e['start'].startswith('2026-09-16') and not e['reasons'] for e in result['events'])
+    assert '2027年度' in result['events'][0]['title']
+    assert result['events'][2]['title'] == '示例研究院人才双选会'
+
+
+def test_separate_stages_keep_separate_locations():
+    text = '''9月14日（周一）：
+示例科技集团招聘会
+宣讲会时间：8:30--9:30
+宣讲会地点：示例校区103教学楼106教室
+招聘会时间：9:30--12:00
+招聘会地点：示例校区体育馆'''
+    events = extract(text, '2026-09-14T14:00+08:00')['events']
+    assert len(events) == 2 and events[1]['location'] == '示例校区体育馆'
+
+
+def test_relative_day_uses_message_timestamp_not_today():
+    events = extract('明天\n学院讲座\n时间：14:00-16:00\n地点：教学楼', '2026-12-31T23:59+08:00')['events']
+    assert events[0]['start'] == '2027-01-01T14:00:00+08:00'
+
+
+@pytest.mark.parametrize('mutation', [lambda s:s.replace('周三','周四'), lambda s:s.replace('9:30-11:30','11:30-9:30'), lambda s:s.replace('9月16日','9月31日'), lambda s:s+'\n活动取消'])
+def test_conflicts_and_cancellations_require_review(mutation):
+    result = extract(mutation(NOTICE), '2026-09-15T12:00+08:00')
+    assert result['events'][0]['reasons']
+
+
+def test_missing_time_is_never_invented():
+    result = extract('明天开会，地点在办公室，时间待定', '2026-09-15T12:00+08:00')
+    assert not result['events'] and result['issues']
+
+
+def test_no_end_is_not_an_all_day_event():
+    result = extract('明天15:00开会，请准时参加', '2026-09-15T12:00+08:00')
+    assert not result['events']
+
+
+def test_recurring_notice_requires_confirmation():
+    result = extract('每周三\n学院讲座\n时间：14:00-16:00\n地点：教学楼', '2026-09-15T12:00+08:00')
+    assert any('重复' in r for r in result['events'][0]['reasons'])
+
+
+class FakeSource:
+    def call(self, action, **kwargs):
+        if action == 'groups': return [{'id':'123@chatroom','name':'测试通知群','last_message_at':0}]
+        return {'messages':[], 'cursor':kwargs['cursor'], 'has_more':False}
+    def fingerprint(self): return 'fingerprint', '/fake/wechat/account'
+
+
+class FakeLark:
+    def __init__(self): self.calls=[]; self.account='account'; self.fail=False
+    def identity(self): return {'profile':'profile','account':self.account,'available':True,'name':'测试用户','status':'ready'}
+    def calendars(self): return [{'id':'cal','name':'目标日历','writable':True,'primary':True}]
+    def canonical(self, x): return 'cal' if x=='primary' else x
+    def create(self, calendar_id, event, key, reminder):
+        self.calls.append((calendar_id,event,key))
+        if self.fail: raise RuntimeError('network timeout')
+        return {'ok':True,'data':{'event':{'event_id':'evt-'+key[-8:],'app_link':'https://applink.feishu.cn/example'}}}
+    def update(self, calendar_id, event_id, event, reminder):
+        self.calls.append(('update',calendar_id,event_id,event))
+        if self.fail: raise RuntimeError('update timeout')
+        return {'ok':True,'data':{'event':{'event_id':event_id,'app_link':'https://applink.feishu.cn/example'}}}
+
+
+@pytest.fixture
+def app(tmp_path):
+    lark=FakeLark(); a=App(tmp_path, FakeSource(), lark)
+    a.connections(); a.add_group({'id':'123@chatroom','calendar_id':'cal','enabled':True})
+    return a
+
+
+def stage(app, mid='message1', changes=None, history=False):
+    future = received_time(time.time()+86400).replace(hour=15,minute=0,second=0,microsecond=0)
+    event={'title':'公司招聘宣讲会','start':future.isoformat(),'end':future.replace(hour=16).isoformat(),'location':'106教室','description':'活动通知','reasons':[]}
+    event.update(changes or {})
+    group=app.db.one('SELECT * FROM groups LIMIT 1')
+    app.stage({'id':mid,'timestamp':time.time(),'text':'活动通知'},group,{'events':[event]},history=history)
+    return app.db.one('SELECT * FROM events WHERE message_id=?',(mid,))['id']
+
+
+def test_duplicate_messages_only_write_once(app):
+    first=stage(app); app.publish(first)
+    second=stage(app,'message2'); result=app.publish(second)
+    assert result['duplicate'] and len(app.lark.calls)==1
+
+
+def test_primary_alias_and_real_calendar_id_share_deduplication(app):
+    first=stage(app);app.publish(first)
+    app.lark.canonical=lambda x:x
+    app.db.set('primary_calendar_id','cal')
+    app.db.execute("UPDATE groups SET calendar_id='primary'")
+    second=stage(app,'message2')
+    assert app.publish(second)['duplicate']
+    assert len(app.lark.calls)==1
+
+
+def test_restart_after_uncertain_remote_success_reuses_idempotency_key(app):
+    first=stage(app); app.lark.fail=True
+    with pytest.raises(RuntimeError): app.publish(first)
+    key=app.lark.calls[0][2]
+    other=App(app.data_dir,app.source,app.lark);app.lark.fail=False;other.publish(first)
+    assert app.lark.calls[-1][2]==key
+    assert other.db.one('SELECT state FROM events WHERE id=?',(first,))['state']=='synced'
+
+
+def test_cannot_mutate_uncertain_request_payload(app):
+    first=stage(app);app.lark.fail=True
+    with pytest.raises(RuntimeError): app.publish(first)
+    with pytest.raises(ValueError,match='原内容'): app.publish(first,edits={'title':'new'})
+
+
+def test_paused_group_blocks_automatic_publish(app):
+    first=stage(app);app.edit_group('123@chatroom',{'enabled':False})
+    assert app.publish(first,automatic=True)['paused']
+    assert not app.lark.calls
+
+
+def test_history_never_publishes_automatically(app):
+    first=stage(app,history=True)
+    assert app.publish(first,automatic=True)['needs_review']
+    assert not app.lark.calls
+
+
+def test_account_switch_blocks_write(app):
+    first=stage(app);app.lark.account='other'
+    with pytest.raises(RuntimeError,match='账号'):app.publish(first)
+    assert not app.lark.calls
+
+
+def test_changed_location_requires_review(app):
+    first=stage(app);app.publish(first)
+    second=stage(app,'message2',{'location':'其他教室'})
+    assert app.db.one('SELECT state FROM events WHERE id=?',(second,))['state']=='pending'
+
+
+def test_update_existing_managed_event_without_creating_second_remote_event(app):
+    first=stage(app);app.publish(first)
+    second=stage(app,'message2',{'location':'其他教室'})
+    app.publish(second,target_event_id=first)
+    assert app.lark.calls[-1][0]=='update'
+    assert app.db.one('SELECT state FROM events WHERE id=?',(first,))['state']=='updated'
+
+
+def test_failed_update_retries_as_update_not_create(app):
+    first=stage(app);app.publish(first)
+    second=stage(app,'message2',{'location':'其他教室'})
+    app.lark.fail=True
+    with pytest.raises(RuntimeError):app.publish(second,target_event_id=first)
+    app.lark.fail=False
+    app.publish(second)
+    assert app.lark.calls[-1][0]=='update'
+
+
+def test_cursor_advances_only_after_durable_ingest(app):
+    class Source(FakeSource):
+        def call(self,action,**kwargs):
+            if action=='groups':return super().call(action,**kwargs)
+            return {'messages':[{'id':'m','text':'大家好','timestamp':int(time.time()),'sender':'某同学','type':'text'}], 'cursor':[99,'db',7], 'has_more':False}
+    app.source=Source();app.sync_once(force=True)
+    assert app.db.one('SELECT state FROM messages WHERE id=?',('m',))['state']=='ignored'
+    assert json.loads(app.db.one('SELECT cursor FROM groups')['cursor'])==[99,'db',7]
+
+
+def test_group_pagination_across_same_timestamp_and_shards(tmp_path,monkeypatch):
+    # Inject a fixture-backed wechat-cli; the bridge must never skip equal-time messages.
+    paths={}
+    for shard in ['message/message_0.db','message/message_1.db']:
+        path=tmp_path/Path(shard).name;paths[shard]=str(path)
+        import hashlib
+        table='Msg_'+hashlib.md5(b'123@chatroom').hexdigest()
+        with sqlite3.connect(path) as c:
+            c.execute(f'CREATE TABLE {table}(local_id,server_id,local_type,create_time,message_content,WCDB_CT_message_content)')
+            for i in range(1,4):c.execute(f'INSERT INTO {table} VALUES(?,?,1,100,?,0)',(i,1000+i+(100 if "_1" in shard else 0),'wxid_sender:\n活动通知'))
+    class Cache:
+        def get(self,k):return paths.get(k)
+    class Context:
+        def __init__(self):self.cache=Cache();self.decrypted_dir='';self.msg_db_keys=list(paths)
+    package=types.ModuleType('wechat_cli');package.__path__=[]
+    core=types.ModuleType('wechat_cli.core');core.__path__=[]
+    monkeypatch.setitem(sys.modules,'wechat_cli',package);monkeypatch.setitem(sys.modules,'wechat_cli.core',core)
+    for name,attrs in {'db_cache':{'DBCache':type('DBCache',(),{})},'context':{'AppContext':Context},'contacts':{'get_contact_names':lambda *_:{},'get_contact_full':lambda *_:[]},'messages':{'decompress_content':lambda v,_:v,'_parse_message_content':lambda v,*_:v.split(':\n',1)}}.items():
+        m=types.ModuleType('wechat_cli.core.'+name);m.__dict__.update(attrs);monkeypatch.setitem(sys.modules,m.__name__,m)
+    monkeypatch.setenv('CALENDAR_APP_DATA',str(tmp_path))
+    from app.wechat_bridge import main
+    cursor=[99,'',0];seen=[]
+    while True:
+        r=main({'action':'messages','group_id':'123@chatroom','cursor':cursor,'limit':2})
+        seen.extend(m['id'] for m in r['messages']);cursor=r['cursor']
+        if not r['has_more']:break
+    assert len(seen)==len(set(seen))==6
+
+
+def test_http_rejects_cross_site_writes_and_rebinding(app):
+    server=serve(app,0);port=server.server_address[1]
+    thread=threading.Thread(target=server.serve_forever,daemon=True);thread.start()
+    root=f'http://127.0.0.1:{port}'
+    try:
+        token=json.load(urllib.request.urlopen(root+'/api/bootstrap'))['token']
+        for headers in [{}, {'X-App-Token':token,'Origin':'https://unrelated.example'}, {'X-App-Token':token,'Host':'evil.example'}]:
+            req=urllib.request.Request(root+'/api/settings',data=b'{}',headers=headers)
+            with pytest.raises(urllib.error.HTTPError) as e:urllib.request.urlopen(req)
+            assert e.value.code==403
+        req=urllib.request.Request(root+'/api/settings',data=b'{"interval":60}',headers={'X-App-Token':token})
+        assert json.load(urllib.request.urlopen(req))['ok']
+    finally:server.shutdown();server.server_close()
