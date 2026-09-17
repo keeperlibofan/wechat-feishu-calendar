@@ -2,7 +2,7 @@
 from __future__ import annotations
 import re
 import unicodedata
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 TZ = ZoneInfo('Asia/Shanghai')
@@ -12,6 +12,9 @@ RANGE = re.compile(r'(\d{1,2})\s*[:：]\s*(\d{2})\s*(?:[-—–~～]+|至|到)\s
 CHANGE = re.compile(r'取消|改期|改为|调整为|时间调整|地点调整|延期|更正|变更|另行通知')
 HINT = re.compile(r'宣讲|招聘|双选|会议|讲座|报告会|活动|通知|报名|答辩|面试|开会|集合|培训|考试')
 BOILER = re.compile(r'^(同学们|各位|大家好|请|欢迎|就业办|联系人|电话|国防科大就业|https?://|重要|明[日天].*预告|今[日天].*预告|宣讲会$)')
+ACTION = r'填写|填报|提交|补充(?:完善)?|完善|核对|确认|报名|报送|缴纳|缴费|完成'
+DEADLINE = re.compile(r'截止|截至|最晚|(?:需|须|务必|必须|请|要|应).{0,12}(?:' + ACTION + r')|(?:内|前)(?:完成|提交|填写|填报|报名|报送|缴费)')
+TIME_POINT = re.compile(r'\d{1,2}[:：]\d{2}|[\d一二三四五六七八九十两]+\s*[点时]|上午|下午|晚上|中午|早上|傍晚')
 
 
 def received_time(value=None):
@@ -49,6 +52,50 @@ def day_for(line, received):
 def tidy_title(line):
     line = re.sub(r'^[\s📢📣!！:：\d、.]+', '', line).strip()
     return line.rstrip(':：;；。')[:180]
+
+
+def deadline_event(text, normalized, ref):
+    """Only day-level action deadlines become all-day events, never vague meetings."""
+    clauses = [s.strip() for s in re.split(r'[。！!？?；;\n❗]+', normalized) if s.strip()]
+    dates, reasons = set(), []
+    for clause in clauses:
+        if not DEADLINE.search(clause): continue
+        if re.search(r'无需|无须|不用|不必|不需要|已完成|已提交|已填写|已缴', clause): continue
+        # Do not discard a specified clock time or choose a day from a date range.
+        if TIME_POINT.search(clause) or re.search(r'\d{1,2}月\d{1,2}[日号]前', clause):
+            return None
+        try:
+            day = day_for(clause, ref)
+        except ValueError:
+            return None
+        if day:
+            if len(DATE.findall(clause)) + len(ISO_DATE.findall(clause)) > 1: return None
+            if len(re.findall(r'大后天|后天|明天|明日|今天|今日|(?:下周|本周|这周|周|星期)[一二三四五六日天]', clause)) > 1: return None
+            dates.add(day)
+            weekday = re.search(r'(?:周|星期)([一二三四五六日天])', clause)
+            if (DATE.search(clause) or ISO_DATE.search(clause)) and weekday:
+                if day.weekday() != '一二三四五六日'.index(weekday[1].replace('天', '日')):
+                    reasons.append('通知中的日期与星期不一致')
+    if len(dates) != 1: return None
+    if CHANGE.search(normalized): reasons.append('这是一条取消或变更通知，请核对原日程')
+    if re.search(r'每周|每月|每年|每天|每星期', normalized): reasons.append('包含重复安排，请核对重复规则')
+    titles = []
+    for clause in clauses:
+        for part in re.split(r'[,，]', clause):
+            if re.search(r'无需|无须|不用|不必|不需要|无法|不能|已完成|已提交|已填写|已缴', part): continue
+            match = re.search(r'(?:' + ACTION + r')([^,，。；;！!？?❗#]+)', part)
+            if not match: continue
+            title = re.split(r'截止|截至|最晚|https?://', match[0], maxsplit=1)[0].strip(' :：')
+            if DATE.search(title) or ISO_DATE.search(title) or TIME_POINT.search(title): continue
+            # A bare "今天需完成" does not supply a task name.
+            if len(match[1].strip()) >= 2 and len(title) <= 80 and title not in ('完成填写', '完成提交', '完成报名'):
+                titles.append(title)
+    if not titles: return None
+    day = dates.pop().isoformat()
+    return {'title': max(titles, key=len) + '（截止）', 'start': day, 'end': day,
+            'all_day': True, 'kind': 'deadline', 'location': '', 'description': text[:12000],
+            'confidence': .96 if not reasons else .5, 'reasons': reasons,
+            'correction': bool(CHANGE.search(normalized))}
 
 
 def extract(text: str, received=None):
@@ -140,7 +187,10 @@ def extract(text: str, received=None):
             events.append({'title': title, 'start': start, 'end': end, 'location': location,
                            'description': text[:12000], 'confidence': .97 if not reasons else .5,
                            'reasons': list(dict.fromkeys(reasons)), 'correction': correction})
-    if not events and (HINT.search(normalized) or re.search(r'\d{1,2}[:：]\d{2}', normalized)):
+    if not events:
+        deadline = deadline_event(text, normalized, ref)
+        if deadline: events.append(deadline)
+    if not events and (HINT.search(normalized) or DEADLINE.search(normalized) or re.search(r'\d{1,2}[:：]\d{2}', normalized)):
         issues.append('发现可能的通知，但日期、时间段或活动名称不完整，请手动补充或使用模型识别')
     return {'events': events, 'issues': issues, 'engine': 'local'}
 
@@ -148,9 +198,23 @@ def extract(text: str, received=None):
 def validate_event(event):
     title = str(event.get('title', '')).strip()
     if not title or len(title) > 180: raise ValueError('请填写 1–180 字的日程名称')
-    start, end = received_time(event['start']), received_time(event['end'])
     if not event.get('start') or not event.get('end'): raise ValueError('请填写开始和结束时间')
+    if event.get('all_day') is True:
+        if not all(isinstance(event[k], str) and re.fullmatch(r'\d{4}-\d{2}-\d{2}', event[k]) for k in ('start', 'end')):
+            raise ValueError('全天日程请填写 YYYY-MM-DD 日期')
+        start, end = date.fromisoformat(event['start']), date.fromisoformat(event['end'])
+        if end < start: raise ValueError('结束日期不能早于开始日期')
+        if (end - start).days >= 7: raise ValueError('超过 7 天的活动请在飞书中处理')
+        return {**event, 'title': title, 'start': start.isoformat(), 'end': end.isoformat(),
+                'location': str(event.get('location', ''))[:300], 'description': str(event.get('description', ''))[:12000]}
+    start, end = received_time(event['start']), received_time(event['end'])
     if end <= start: raise ValueError('结束时间必须晚于开始时间')
     if end - start > timedelta(days=7): raise ValueError('超过 7 天的活动请在飞书中处理')
     return {**event, 'title': title, 'start': start.isoformat(), 'end': end.isoformat(),
             'location': str(event.get('location', ''))[:300], 'description': str(event.get('description', ''))[:12000]}
+
+
+def event_end_time(event):
+    # Feishu's all-day end date is inclusive; it expires at next local midnight.
+    end = received_time(event['end'])
+    return end + timedelta(days=1) if event.get('all_day') is True else end

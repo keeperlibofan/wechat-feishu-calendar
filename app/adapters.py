@@ -117,11 +117,12 @@ class Lark:
 
     def payload(self, event, reminder=5):
         event = validate_event(event)
+        all_day = event.get('all_day') is True
         return {'summary': event['title'], 'description_rich': event.get('description', ''),
-                'start_time': {'timestamp': str(int(received_time(event['start']).timestamp())), 'timezone': 'Asia/Shanghai'},
-                'end_time': {'timestamp': str(int(received_time(event['end']).timestamp())), 'timezone': 'Asia/Shanghai'},
-                'location': {'name': event['location']}, 'reminders': [{'minutes': int(reminder)}],
-                'vchat': {'vc_type': 'no_meeting'}, 'free_busy_status': 'busy', 'visibility': 'default', 'need_notification': False}
+                'start_time': {'date': event['start']} if all_day else {'timestamp': str(int(received_time(event['start']).timestamp())), 'timezone': 'Asia/Shanghai'},
+                'end_time': {'date': event['end']} if all_day else {'timestamp': str(int(received_time(event['end']).timestamp())), 'timezone': 'Asia/Shanghai'},
+                'location': {'name': event['location']}, 'reminders': [] if all_day else [{'minutes': int(reminder)}],
+                'vchat': {'vc_type': 'no_meeting'}, 'free_busy_status': 'free' if all_day else 'busy', 'visibility': 'default', 'need_notification': False}
 
     def create(self, calendar_id, event, key, reminder=5, dry_run=False):
         args = ['calendar', 'events', 'create', '--as', 'user', '--calendar-id', calendar_id,

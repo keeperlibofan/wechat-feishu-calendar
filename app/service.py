@@ -7,13 +7,14 @@ import threading
 import time
 import uuid
 from .adapters import IntegrationError, Lark, WeChat, model_config, model_extract
-from .extractor import extract, received_time, validate_event
+from .extractor import extract, received_time, validate_event, event_end_time
 from .store import Store
 
 
 def event_fingerprint(event):
     clean = lambda s: re.sub(r'[\s\W_]+', '', str(s)).casefold()
     key = [clean(event['title']), received_time(event['start']).isoformat(), received_time(event['end']).isoformat(), clean(event.get('location', ''))]
+    if event.get('all_day') is True: key.append('all_day')
     return hashlib.sha256(json.dumps(key, ensure_ascii=False).encode()).hexdigest()
 
 
@@ -69,7 +70,7 @@ class App:
 
     def calendar(self, calendar_id):
         for item in self.connections()['calendars']:
-            if item['id'] == calendar_id and item.get('writable'): return item
+            if (item['id'] == calendar_id or (calendar_id == 'primary' and item.get('primary'))) and item.get('writable'): return item
         raise ValueError('请选择你有写入权限的飞书日历')
 
     def canonical_calendar(self, calendar_id):
@@ -123,7 +124,7 @@ class App:
             if history: reasons.append('历史消息，确认后添加')
             try:
                 validate_event(event)
-                if received_time(event['end']).timestamp() <= now: reasons.append('活动已结束')
+                if event_end_time(event).timestamp() <= now: reasons.append('活动已结束')
                 if received_time(event['start']).timestamp() > now + 366 * 86400: reasons.append('活动超过一年，请核对日期')
             except (ValueError, KeyError): reasons.append('日期或时间需要补充')
             # A same-title notification changing time/location must not silently become a second event.
@@ -141,7 +142,7 @@ class App:
 
     def process_message(self, message, group):
         if message['type'] == 'image':
-            self.db.execute("UPDATE messages SET state='review',error='图片消息暂不能可靠定位原图；请在识别工作台粘贴图片中的文字' WHERE id=?", (message['id'],))
+            self.db.execute("UPDATE messages SET state='review',error='已收到图片；当前版本尚不支持微信图片解密与文字识别，请在识别工作台补充图中文字' WHERE id=?", (message['id'],))
             return
         if message['type'] != 'text' or not message['text'].strip():
             self.db.execute("UPDATE messages SET state='ignored' WHERE id=?", (message['id'],)); return
@@ -154,6 +155,22 @@ class App:
             self.db.execute('UPDATE messages SET state=?,error=? WHERE id=?', (state, '；'.join(result['issues']), message['id']))
         except Exception as exc:
             self.db.execute("UPDATE messages SET state='error',error=? WHERE id=?", (str(exc)[:800], message['id']))
+
+    def retry_message(self, message_id):
+        with self.sync_lock:
+            message = self.db.one('SELECT * FROM messages WHERE id=?', (message_id,))
+            if not message: raise ValueError('找不到原始通知')
+            if message['state'] not in ('review', 'error'): return {'already_processed': True}
+            if message['type'] != 'text': raise ValueError('图片通知请先补充图中文字')
+            group = self.db.one('SELECT * FROM groups WHERE id=?', (message['group_id'],))
+            if not group: raise ValueError('同步群不存在')
+            if self.db.one('SELECT id FROM events WHERE message_id=?', (message_id,)):
+                raise ValueError('已有日程候选，请直接核对或重试候选')
+            self.process_message(message, group)
+            for event in self.db.rows("SELECT id FROM events WHERE message_id=? AND state='ready'", (message_id,)):
+                self.publish(event['id'], automatic=True)
+            message = self.db.one('SELECT state,error FROM messages WHERE id=?', (message_id,))
+            return {**message, 'events': self.db.rows('SELECT id,state,lark_id,app_link FROM events WHERE message_id=?', (message_id,))}
 
     def sync_once(self, force=False):
         if not self.sync_lock.acquire(blocking=False): return {'busy': True}

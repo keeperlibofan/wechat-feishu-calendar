@@ -8,7 +8,8 @@ import threading
 import urllib.request
 import urllib.error
 import pytest
-from app.extractor import extract, validate_event, received_time
+from app.extractor import extract, validate_event, received_time, event_end_time
+from app.adapters import Lark
 from app.service import App
 from app.__main__ import serve
 
@@ -81,6 +82,56 @@ def test_recurring_notice_requires_confirmation():
     assert any('重复' in r for r in result['events'][0]['reasons'])
 
 
+DEADLINE_NOTICE = '''@所有人 重要通知，请查看后填写！今天需完成，否则影响登记。
+请核对统计表信息，并补充完善校园卡账号和登记日期。
+【在线文档】示例信息统计表
+https://example.invalid/sheet'''
+
+
+def test_day_deadline_preserves_source_and_uses_message_date():
+    result = extract(DEADLINE_NOTICE, '2026-09-17T09:24:00+08:00')
+    event, = result['events']
+    assert event['all_day'] is True and event['kind'] == 'deadline'
+    assert event['start'] == event['end'] == '2026-09-17'
+    assert event['title'] == '补充完善校园卡账号和登记日期（截止）'
+    assert event['description'] == DEADLINE_NOTICE
+    assert not event['location'] and not event['reasons']
+    assert event_end_time(event).isoformat() == '2026-09-18T00:00:00+08:00'
+
+
+@pytest.mark.parametrize('text', [
+    '明天15:00前提交申请材料。',
+    '明天下午需完成材料申报。',
+    '请于9月18日前提交材料。',
+    '尽快完成信息填报。',
+    '今天需完成。',
+    '9月31日截止，请提交申请材料。',
+    '请9月18日提交申请材料，9月19日完成审核。',
+    '请今天提交申请材料，明天完成审核。',
+    '今天无需完成。请核对统计表信息。',
+])
+def test_ambiguous_or_clock_deadlines_are_not_converted_to_all_day(text):
+    assert not extract(text, '2026-09-17T09:00:00+08:00')['events']
+
+
+def test_day_deadline_conflict_and_recurrence_stay_reviewable():
+    for text in ['9月18日（周四）截止，请提交申请材料。',
+                 '每周五需完成信息填报。',
+                 '今天需完成信息填报。此通知取消。']:
+        assert extract(text, '2026-09-17T09:00:00+08:00')['events'][0]['reasons']
+
+
+def test_all_day_lark_payload_uses_inclusive_dates_and_does_not_block_the_day(tmp_path):
+    event = extract(DEADLINE_NOTICE, '2026-09-17T09:24:00+08:00')['events'][0]
+    payload = Lark(tmp_path).payload(event)
+    assert payload['start_time'] == payload['end_time'] == {'date': '2026-09-17'}
+    assert payload['free_busy_status'] == 'free'
+    assert payload['need_notification'] is False
+    assert payload['reminders'] == []
+    for start, end in [('2026-09-18', '2026-09-17'), ('2026-09-17T00:00:00+08:00', '2026-09-18'), ('2026-09-17', '2026-09-24')]:
+        with pytest.raises(ValueError): validate_event({**event, 'start': start, 'end': end})
+
+
 class FakeSource:
     def call(self, action, **kwargs):
         if action == 'groups': return [{'id':'123@chatroom','name':'测试通知群','last_message_at':0}]
@@ -133,6 +184,59 @@ def test_primary_alias_and_real_calendar_id_share_deduplication(app):
     second=stage(app,'message2')
     assert app.publish(second)['duplicate']
     assert len(app.lark.calls)==1
+
+
+def test_primary_alias_still_allows_group_settings_after_calendar_list_permission(app):
+    app.db.execute("UPDATE groups SET calendar_id='primary'")
+    app.edit_group('123@chatroom', {'enabled': False})
+    group = app.db.one('SELECT * FROM groups')
+    assert group['calendar_id'] == 'cal' and not group['enabled']
+
+
+def test_retry_missed_today_deadline_publishes_once_and_keeps_cursor(app, monkeypatch):
+    now = received_time('2026-09-17T11:00:00+08:00').timestamp()
+    monkeypatch.setattr(time, 'time', lambda: now)
+    cursor = app.db.one('SELECT cursor FROM groups')['cursor']
+    app.db.execute("INSERT INTO messages(id,group_id,text,timestamp,sender,type,state,error,created) VALUES(?,?,?,?,?,'text','review','旧版不支持',?)",
+                   ('deadline', '123@chatroom', DEADLINE_NOTICE, now-3600, '示例同学', now))
+    result = app.retry_message('deadline')
+    assert result['state'] == 'done' and result['events'][0]['state'] == 'synced'
+    assert len(app.lark.calls) == 1 and app.lark.calls[0][1]['all_day'] is True
+    assert app.retry_message('deadline')['already_processed']
+    assert len(app.lark.calls) == 1
+    assert app.db.one('SELECT cursor FROM groups')['cursor'] == cursor
+
+
+def test_ignored_notice_is_not_restored_by_retry(app):
+    now = time.time()
+    app.db.execute("INSERT INTO messages(id,group_id,text,timestamp,sender,type,state,created) VALUES(?,?,?,?,?,'text','ignored',?)",
+                   ('ignored-day', '123@chatroom', DEADLINE_NOTICE, now, '示例同学', now))
+    assert app.retry_message('ignored-day')['already_processed']
+    assert app.db.one("SELECT state FROM messages WHERE id='ignored-day'")['state'] == 'ignored'
+    assert not app.db.events() and not app.lark.calls
+
+
+def test_incremental_day_deadline_is_synced_once_across_checks(app):
+    class Source(FakeSource):
+        def call(self, action, **kwargs):
+            if action == 'groups': return super().call(action, **kwargs)
+            return {'messages': [{'id': 'new-deadline', 'text': DEADLINE_NOTICE,
+                    'timestamp': int(time.time()), 'sender': '示例同学', 'type': 'text'}],
+                    'cursor': [int(time.time()), 'db', 1], 'has_more': False}
+    app.source = Source()
+    app.sync_once(force=True)
+    app.sync_once(force=True)
+    assert len(app.lark.calls) == 1
+    event, = app.db.events()
+    assert event['state'] == 'synced' and event['event']['all_day'] is True
+
+
+def test_expired_deadline_is_not_automatically_published(app, monkeypatch):
+    monkeypatch.setattr(time, 'time', lambda: received_time('2026-09-18T01:00:00+08:00').timestamp())
+    event = extract(DEADLINE_NOTICE, '2026-09-17T09:24:00+08:00')['events'][0]
+    eid = stage(app, changes=event)
+    assert app.publish(eid, automatic=True)['needs_review']
+    assert not app.lark.calls
 
 
 def test_restart_after_uncertain_remote_success_reuses_idempotency_key(app):

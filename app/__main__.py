@@ -86,6 +86,7 @@ def serve(app, port):
                     result = {'ok': True}
                 elif path == '/api/messages/ignore':
                     app.db.execute("UPDATE messages SET state='ignored' WHERE id=?", (data['id'],)); result = {'ok': True}
+                elif path == '/api/messages/retry': result = app.job('retry:' + data['id'], lambda: app.retry_message(data['id']))
                 elif path == '/api/sync': result = app.job('sync', lambda: app.sync_once(force=True))
                 elif path == '/api/auth/start': result = app.lark.auth_start()
                 elif path == '/api/auth/finish':
