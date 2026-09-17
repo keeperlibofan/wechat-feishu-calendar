@@ -33,6 +33,9 @@ class Store:
             columns = {row[1] for row in db.execute('PRAGMA table_info(events)')}
             if 'operation_target' not in columns:
                 db.execute("ALTER TABLE events ADD COLUMN operation_target TEXT NOT NULL DEFAULT ''")
+            message_columns = {row[1] for row in db.execute('PRAGMA table_info(messages)')}
+            for name, declaration in [('metadata', "TEXT NOT NULL DEFAULT '{}'"), ('attempts', 'INTEGER NOT NULL DEFAULT 0'), ('next_retry', 'REAL NOT NULL DEFAULT 0')]:
+                if name not in message_columns: db.execute(f'ALTER TABLE messages ADD COLUMN {name} {declaration}')
         os.chmod(self.path, 0o600)
 
     @contextmanager

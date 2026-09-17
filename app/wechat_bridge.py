@@ -14,6 +14,13 @@ from contextlib import closing
 os.umask(0o077)
 checkout = Path(os.environ.get('WECHAT_CLI_DIR', str(Path.home() / '文档/wechat/wechat-cli')))
 sys.path.insert(0, str(checkout))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from app.wechat_media import classify, decode_message_image
+
+
+def message_id(username, server_id, key, local_id, timestamp):
+    raw = f'{username}|{server_id}' if server_id else f'{username}|{key}|{local_id}|{timestamp}'
+    return hashlib.sha256(raw.encode()).hexdigest()
 
 
 def main(request):
@@ -40,10 +47,24 @@ def main(request):
                     groups[username] = {'id': username, 'name': names.get(username) or groups.get(username, {}).get('name') or username, 'last_message_at': ts or 0}
         query = request.get('query', '').casefold()
         return sorted([g for g in groups.values() if query in (g['name'] + g['id']).casefold()], key=lambda g: -g['last_message_at'])
-    if request['action'] != 'messages': raise ValueError('未知的读取操作')
+    if request['action'] not in ('messages', 'content'): raise ValueError('未知的读取操作')
     username = str(request['group_id'])
     if not username.endswith('@chatroom') or len(username) > 100: raise ValueError('请选择真实的微信群')
     table = 'Msg_' + hashlib.md5(username.encode()).hexdigest()
+    if request['action'] == 'content':
+        for key in sorted(app.msg_db_keys):
+            path = app.cache.get(key)
+            if not path: continue
+            with closing(sqlite3.connect(f'file:{path}?mode=ro', uri=True)) as conn:
+                if not conn.execute('SELECT 1 FROM sqlite_master WHERE name=?', (table,)).fetchone(): continue
+                query = f'SELECT local_id,server_id,local_type,create_time,message_content,WCDB_CT_message_content FROM [{table}] WHERE create_time=?'
+                for local_id, server_id, kind, ts, content, ct in conn.execute(query, (int(request['timestamp']),)):
+                    if message_id(username, server_id, key, local_id, ts) != request['message_id']: continue
+                    _, body = _parse_message_content(decompress_content(content, ct) or '', kind, True)
+                    info = classify(body, kind)
+                    if info['type'] == 'image': info.update(decode_message_image(app, username, info.pop('md5'), os.environ['CALENDAR_APP_DATA']))
+                    return info
+        raise ValueError('本机暂未找到这条原始消息，稍后自动重试')
     cursor = request.get('cursor') or [int(request.get('since', 0)), '', 0]
     size = max(1, min(int(request.get('limit', 250)), 500))
     rows = []
@@ -59,13 +80,9 @@ def main(request):
             for local_id, server_id, kind, ts, content, ct in conn.execute(query, (*params, size + 1)):
                 body = decompress_content(content, ct) or ''
                 sender, body = _parse_message_content(body, kind, True)
-                base_type = int(kind) & 0xFFFFFFFF
-                # Never guess an image by selecting a random file from an attachment directory.
-                if base_type != 1:
-                    body = '[图片通知：请复制文字后导入]' if base_type == 3 else ''
-                raw = f'{username}|{server_id}' if server_id else f'{username}|{key}|{local_id}|{ts}'
-                rows.append({'id': hashlib.sha256(raw.encode()).hexdigest(), 'text': str(body), 'timestamp': ts,
-                             'sender': names.get(sender, sender), 'type': 'text' if base_type == 1 else ('image' if base_type == 3 else 'other'),
+                info = classify(body, kind)
+                rows.append({'id': message_id(username, server_id, key, local_id, ts), 'text': info['text'], 'timestamp': ts,
+                             'sender': names.get(sender, sender), 'type': info['type'],
                              'cursor': [ts, key, local_id]})
     rows.sort(key=lambda x: x['cursor'])
     page = rows[:size]
@@ -77,5 +94,5 @@ if __name__ == '__main__':
         data = main(json.load(sys.stdin))
         print(json.dumps({'ok': True, 'data': data}, ensure_ascii=False))
     except Exception as exc:
-        print(json.dumps({'ok': False, 'error': str(exc)}, ensure_ascii=False))
+        print(json.dumps({'ok': False, 'error': str(exc), 'code': getattr(exc, 'code', 'connection')}, ensure_ascii=False))
         sys.exit(1)

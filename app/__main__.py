@@ -3,6 +3,7 @@ import argparse
 import json
 import mimetypes
 import os
+import re
 from pathlib import Path
 import secrets
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -28,6 +29,7 @@ def serve(app, port):
             self.send_header('Content-Length', str(len(body)))
             self.send_header('Cache-Control', 'no-store')
             self.send_header('X-Content-Type-Options', 'nosniff')
+            self.send_header('Cross-Origin-Resource-Policy', 'same-origin')
             self.send_header('Referrer-Policy', 'same-origin')
             self.send_header('Content-Security-Policy', "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'")
             self.end_headers()
@@ -54,6 +56,14 @@ def serve(app, port):
                 if path == '/api/state': return self.respond(app.state())
                 if path == '/api/connections': return self.respond(app.connections(query.get('refresh') == ['1']))
                 if path == '/api/groups/search': return self.respond({'groups': app.groups_available(query.get('q', [''])[0])})
+                if path == '/api/messages/image':
+                    row = app.db.one('SELECT metadata FROM messages WHERE id=? AND type=\'image\'', (query.get('id', [''])[0],))
+                    name = json.loads(row['metadata']).get('image_id', '') if row else ''
+                    if not re.fullmatch(r'[0-9a-f]{32}\.(jpg|png|gif|webp|tiff)', name): return self.respond({'error': '原图尚未读取'}, 404)
+                    root = (app.data_dir / 'images').resolve()
+                    image = (root / name).resolve()
+                    if not image.is_relative_to(root) or not image.is_file(): return self.respond({'error': '图片缓存暂不可用'}, 404)
+                    return self.send_bytes(image.read_bytes(), mimetypes.guess_type(name)[0] or 'image/jpeg')
                 if path == '/api/auth/qr':
                     file = app.data_dir / 'auth.png'
                     if not file.exists(): return self.respond({'error': '请先发起授权'}, 404)
@@ -85,8 +95,11 @@ def serve(app, port):
                     with app.publish_lock: app.db.execute("UPDATE events SET state='ignored' WHERE id=? AND state IN ('pending','ready')", (data['id'],))
                     result = {'ok': True}
                 elif path == '/api/messages/ignore':
-                    app.db.execute("UPDATE messages SET state='ignored' WHERE id=?", (data['id'],)); result = {'ok': True}
-                elif path == '/api/messages/retry': result = app.job('retry:' + data['id'], lambda: app.retry_message(data['id']))
+                    with app.publish_lock:
+                        app.db.execute("UPDATE messages SET state='ignored',next_retry=0 WHERE id=?", (data['id'],))
+                        app.db.execute("UPDATE events SET state='ignored' WHERE message_id=? AND state IN ('pending','ready')", (data['id'],))
+                    result = {'ok': True}
+                elif path == '/api/messages/retry': result = app.job('retry:' + data['id'], lambda: app.retry_message(data['id'], data.get('restore_unsupported', False)))
                 elif path == '/api/sync': result = app.job('sync', lambda: app.sync_once(force=True))
                 elif path == '/api/auth/start': result = app.lark.auth_start()
                 elif path == '/api/auth/finish':

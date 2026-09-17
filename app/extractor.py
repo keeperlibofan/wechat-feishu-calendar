@@ -10,7 +10,7 @@ DATE = re.compile(r'(?:(20\d{2})\s*年\s*)?(\d{1,2})\s*月\s*(\d{1,2})\s*[日号
 ISO_DATE = re.compile(r'\b(20\d{2})[-/](\d{1,2})[-/](\d{1,2})\b')
 RANGE = re.compile(r'(\d{1,2})\s*[:：]\s*(\d{2})\s*(?:[-—–~～]+|至|到)\s*(\d{1,2})\s*[:：]\s*(\d{2})')
 CHANGE = re.compile(r'取消|改期|改为|调整为|时间调整|地点调整|延期|更正|变更|另行通知')
-HINT = re.compile(r'宣讲|招聘|双选|会议|讲座|报告会|活动|通知|报名|答辩|面试|开会|集合|培训|考试')
+HINT = re.compile(r'宣讲|招聘|推介|双选|会议|讲座|报告会|活动|通知|报名|答辩|面试|开会|集合|培训|考试')
 BOILER = re.compile(r'^(同学们|各位|大家好|请|欢迎|就业办|联系人|电话|国防科大就业|https?://|重要|明[日天].*预告|今[日天].*预告|宣讲会$)')
 ACTION = r'填写|填报|提交|补充(?:完善)?|完善|核对|确认|报名|报送|缴纳|缴费|完成'
 DEADLINE = re.compile(r'截止|截至|最晚|(?:需|须|务必|必须|请|要|应).{0,12}(?:' + ACTION + r')|(?:内|前)(?:完成|提交|填写|填报|报名|报送|缴费)')
@@ -119,6 +119,7 @@ def extract(text: str, received=None):
         except ValueError:
             pass
     events, issues = [], []
+    heading_title = ''
     correction = bool(CHANGE.search(normalized))
     for block in blocks:
         day, date_error = inherited, ''
@@ -133,14 +134,18 @@ def extract(text: str, received=None):
             except ValueError:
                 date_error = '日期无效'; day = None
         ranges = [(i, m) for i, line in enumerate(block) for m in RANGE.finditer(line)]
-        if not ranges: continue
         labeled_title = next((re.split(r'[:：]', line, 1)[1].strip() for line in block
                               if re.match(r'^(单位|主办单位|主题|活动名称|会议名称|标题)\s*[:：]', line)), '')
         candidates = [tidy_title(line) for line in block
                       if not (DATE.search(line) or ISO_DATE.search(line) or RANGE.search(line)
                               or re.search(r'时间\s*[:：]|地点\s*[:：]', line) or BOILER.search(line))
-                      and HINT.search(line)]
-        base_title = tidy_title(labeled_title) or (candidates[0] if candidates else '')
+                      and not re.search(r'日程$|安排$|报名方式|参会部门|席位有限|扫码报名|期待.*见', line)
+                      and (HINT.search(line) or ('专场' in line and len(line) < 60))]
+        if not ranges:
+            if labeled_title or candidates: heading_title = tidy_title(labeled_title) or ' '.join(candidates[:3])[:180]
+            continue
+        base_title = tidy_title(labeled_title) or heading_title or (candidates[0] if candidates else '')
+        heading_title = ''
         for number, (index, match) in enumerate(ranges):
             reasons = []
             if not day: reasons.append('未识别到明确日期')
@@ -163,7 +168,7 @@ def extract(text: str, received=None):
                     start, end = begin.isoformat(), finish.isoformat()
             except ValueError:
                 reasons.append('时间范围无效')
-            role_match = re.search(r'(宣讲会|双选会|招聘会|面试|笔试|报告会|会议)时间', block[index])
+            role_match = re.search(r'(宣讲会|推介会|双选会|招聘会|面试|笔试|报告会|会议)时间', block[index])
             role = role_match[1] if role_match else ''
             title = base_title
             if title and role:

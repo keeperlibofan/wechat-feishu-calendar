@@ -104,7 +104,8 @@ class App:
 
     def state(self):
         events = self.db.events()
-        issues = self.db.rows("SELECT m.*,g.name AS group_name FROM messages m LEFT JOIN groups g ON g.id=m.group_id WHERE m.state IN ('review','error') ORDER BY m.created DESC LIMIT 60")
+        issues = self.db.rows("SELECT m.*,g.name AS group_name FROM messages m LEFT JOIN groups g ON g.id=m.group_id WHERE m.state IN ('review','error','waiting') ORDER BY m.created DESC LIMIT 60")
+        for message in issues: message['metadata'] = json.loads(message.get('metadata') or '{}')
         counts = {r['state']: r['n'] for r in self.db.rows('SELECT state,COUNT(*) n FROM events GROUP BY state')}
         groups = self.db.rows('SELECT * FROM groups ORDER BY created')
         return {'groups': groups, 'events': events, 'issues': issues, 'counts': counts, 'runtime': self.runtime.copy(),
@@ -141,27 +142,64 @@ class App:
         return len(result['events'])
 
     def process_message(self, message, group):
-        if message['type'] == 'image':
-            self.db.execute("UPDATE messages SET state='review',error='已收到图片；当前版本尚不支持微信图片解密与文字识别，请在识别工作台补充图中文字' WHERE id=?", (message['id'],))
-            return
-        if message['type'] != 'text' or not message['text'].strip():
+        is_media = message['type'] in ('image', 'article')
+        if not is_media and (message['type'] != 'text' or not message['text'].strip()):
             self.db.execute("UPDATE messages SET state='ignored' WHERE id=?", (message['id'],)); return
         try:
-            result = extract(message['text'], message['timestamp'])
+            metadata = {}
+            if is_media:
+                media = self.source.resolve(message)
+                metadata = {k: media[k] for k in ('engine', 'confidence', 'source_url', 'image_id', 'verified', 'title') if k in media}
+                message = {**message, 'text': media['text']}
+                self.db.execute('UPDATE messages SET text=?,metadata=? WHERE id=?',
+                    (message['text'], json.dumps(metadata, ensure_ascii=False), message['id']))
+                result = {'events': [], 'issues': list(media.get('issues', [])), 'engine': media['engine']}
+                seen = set()
+                for document in media.get('documents', [media]):
+                    found = extract(document['text'], message['timestamp'])
+                    for event in found['events']:
+                        event['reasons'].extend(media.get('issues', []))
+                        if document.get('confidence', 1) < .9: event['reasons'].append('图片文字识别置信度偏低，请核对时间、地点和名称')
+                        event['source_type'] = message['type']
+                        event['source_engine'] = document['engine']
+                        if document.get('description'):
+                            event['description'] += '\n\n文章补充：' + document['description'][:12000]
+                        if metadata.get('source_url'):
+                            event['source_url'] = metadata['source_url']
+                            event['description'] = '原文链接：' + metadata['source_url'] + '\n\n' + event['description']
+                        signature = json.dumps([event['title'], event['start'], event['end'], event['location']], ensure_ascii=False)
+                        if signature not in seen: result['events'].append(event); seen.add(signature)
+                    result['issues'].extend(found['issues'])
+            else:
+                result = extract(message['text'], message['timestamp'])
             if result['issues'] and not result['events'] and self.db.get('model_enabled', False):
                 result = model_extract(message['text'], message['timestamp'])
-            self.stage(message, group, result)
-            state = 'review' if result['issues'] and not result['events'] else ('done' if result['events'] else 'ignored')
-            self.db.execute('UPDATE messages SET state=?,error=? WHERE id=?', (state, '；'.join(result['issues']), message['id']))
+            with self.publish_lock:
+                current = self.db.one('SELECT state FROM messages WHERE id=?', (message['id'],))
+                if current and current['state'] == 'ignored': return
+                self.stage(message, group, result)
+                state = 'review' if result['issues'] and not result['events'] else ('done' if result['events'] else 'ignored')
+                self.db.execute('UPDATE messages SET state=?,error=?,next_retry=0 WHERE id=?', (state, '；'.join(result['issues']) if state == 'review' else '', message['id']))
         except Exception as exc:
-            self.db.execute("UPDATE messages SET state='error',error=? WHERE id=?", (str(exc)[:800], message['id']))
+            if is_media:
+                attempts = int(message.get('attempts', 0)) + 1
+                waiting = getattr(exc, 'code', '') not in ('unsupported_media', 'media_setup')
+                delay = min(30 * 2 ** min(attempts - 1, 6), 1800)
+                self.db.execute("UPDATE messages SET state=?,error=?,attempts=?,next_retry=? WHERE id=? AND state!='ignored'",
+                    ('waiting' if waiting else 'review', str(exc)[:800], attempts, time.time() + delay if waiting else 0, message['id']))
+            else:
+                self.db.execute("UPDATE messages SET state='error',error=? WHERE id=?", (str(exc)[:800], message['id']))
 
-    def retry_message(self, message_id):
+    def retry_message(self, message_id, restore_unsupported=False):
         with self.sync_lock:
             message = self.db.one('SELECT * FROM messages WHERE id=?', (message_id,))
             if not message: raise ValueError('找不到原始通知')
-            if message['state'] not in ('review', 'error'): return {'already_processed': True}
-            if message['type'] != 'text': raise ValueError('图片通知请先补充图中文字')
+            if restore_unsupported and message['type'] == 'other' and message['state'] == 'ignored' and not message['text']:
+                info = self.source.call('content', group_id=message['group_id'], message_id=message['id'], timestamp=message['timestamp'])
+                if info['type'] != 'article': raise ValueError('这条旧消息不是文章分享')
+                self.db.execute("UPDATE messages SET type='article',state='review',text=? WHERE id=?", (info['text'], message_id))
+                message = self.db.one('SELECT * FROM messages WHERE id=?', (message_id,))
+            if message['state'] not in ('review', 'error', 'waiting'): return {'already_processed': True}
             group = self.db.one('SELECT * FROM groups WHERE id=?', (message['group_id'],))
             if not group: raise ValueError('同步群不存在')
             if self.db.one('SELECT id FROM events WHERE message_id=?', (message_id,)):
@@ -204,7 +242,7 @@ class App:
                         self.db.execute('UPDATE groups SET last_error=? WHERE id=?', (str(exc)[:800], group['id']))
                 self.last_fingerprint, self.more_pending = fingerprint, more
             for group in groups:
-                for msg in self.db.rows("SELECT * FROM messages WHERE group_id=? AND state='new' ORDER BY timestamp,created LIMIT 100", (group['id'],)):
+                for msg in self.db.rows("SELECT * FROM messages WHERE group_id=? AND (state='new' OR (state='waiting' AND (next_retry<=? OR ?))) ORDER BY timestamp,created LIMIT 30", (group['id'], time.time(), int(force))):
                     self.process_message(msg, group)
             for event in self.db.rows("SELECT e.id,e.group_id FROM events e JOIN groups g ON g.id=e.group_id WHERE e.state='ready' AND g.enabled=1 LIMIT 40"):
                 try: self.publish(event['id'], automatic=True)

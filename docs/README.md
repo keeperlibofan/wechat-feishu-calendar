@@ -51,4 +51,4 @@ python3 docs/tools/demo.py
 python3 docs/tools/render_assets.py --screenshots /path/to/screenshots
 ```
 
-脚本为截图添加统一边框和“演示数据”标识。原始截图不应包含真实群名、账号、聊天内容或令牌。
+脚本为截图添加统一边框和“演示数据”标识。原始截图不应包含真实群名、账号、聊天内容或令牌。可以裁剪到页面的内容区域，保留完整功能内容；当前工作台截图已按此方式更新。

@@ -11,7 +11,8 @@ import tomllib
 import urllib.error
 import urllib.request
 import uuid
-from .extractor import received_time, validate_event
+from .extractor import extract, received_time, validate_event
+from .articles import read_article, article_image, ArticleError
 
 
 class IntegrationError(RuntimeError):
@@ -25,6 +26,63 @@ class WeChat:
         self.data_dir = Path(data_dir)
         self.checkout = Path(os.environ.get('WECHAT_CLI_DIR', str(Path.home() / '文档/wechat/wechat-cli')))
         self.lock = threading.Lock()
+
+    def ocr(self, path):
+        image = Path(path).resolve()
+        if not image.is_relative_to((self.data_dir / 'images').resolve()) or not image.is_file():
+            raise IntegrationError('未找到已校验的图片缓存')
+        digest = hashlib.sha256(image.read_bytes()).hexdigest()
+        cache = self.data_dir / 'images' / (digest + '.ocr.json')
+        if cache.exists():
+            try: return json.loads(cache.read_text())
+            except (ValueError, OSError): pass
+        configured = os.environ.get('CALENDAR_OCR_PYTHON')
+        candidates = [Path(configured)] if configured else [
+            self.data_dir / 'ocr-venv/bin/python',
+            Path(__file__).resolve().parents[1] / '.venv-media/bin/python',
+            Path.home() / 'repository/linux-wechat-rpa/.venv/bin/python',
+        ]
+        python = next((p for p in candidates if p.is_file()), None)
+        if not python: raise IntegrationError('本机 OCR 尚未安装，请运行 scripts/install_ocr.py 完成一次安装', 'media_setup')
+        try:
+            result = subprocess.run([str(python), str(Path(__file__).with_name('ocr_bridge.py'))],
+                input=json.dumps({'path': str(image)}), text=True, capture_output=True, timeout=60,
+                env={**os.environ, 'CALENDAR_APP_DATA': str(self.data_dir), 'OMP_NUM_THREADS': '2'})
+            response = json.loads(result.stdout)
+        except subprocess.TimeoutExpired: raise IntegrationError('图片文字识别超时，稍后自动重试') from None
+        except (ValueError, OSError): raise IntegrationError('本机图片识别服务未返回有效结果') from None
+        if not response.get('ok'): raise IntegrationError(response.get('error', '图片识别失败'), response.get('code', 'media_wait'))
+        data = response['data']
+        if not data.get('text', '').strip(): raise IntegrationError('原图已读取，但没有识别出可用文字', 'unsupported_media')
+        temporary = cache.with_suffix('.tmp'); temporary.write_text(json.dumps(data, ensure_ascii=False)); temporary.chmod(0o600); temporary.replace(cache)
+        return data
+
+    def resolve(self, message):
+        info = self.call('content', group_id=message['group_id'], message_id=message['id'], timestamp=message['timestamp'])
+        if info['type'] == 'image':
+            data = self.ocr(info['path'])
+            return {**data, 'type': 'image', 'issues': [], 'verified': info['verified'], 'image_id': Path(info['path']).name}
+        if info['type'] != 'article': raise IntegrationError('这条消息不是可读取的图片或文章', 'unsupported_media')
+        try:
+            article = read_article(info['url'], info['title'])
+            documents = [{'text': article['text'], 'confidence': 1., 'engine': 'article', 'description': article.get('description', '')}]
+            local = extract(article['text'], message['timestamp'])
+            issues = []
+            if not any(not e.get('reasons') for e in local['events']):
+                for url in article['images']:
+                    try: documents.append(self.ocr(article_image(url, self.data_dir)))
+                    except (ArticleError, IntegrationError) as exc:
+                        if getattr(exc, 'code', '') == 'media_setup': raise
+                        retryable = exc.retryable if isinstance(exc, ArticleError) else exc.code not in ('unsupported_media', 'media_setup')
+                        if retryable: raise IntegrationError('文章中部分图片暂未读完，后台会继续重试', 'media_wait') from None
+                        issues.append('文章中部分图片无法识别，请核对正文安排')
+                if article.get('more_images'): issues.append('文章图片超过单次识别上限，请核对正文安排')
+            text = '\n\n'.join(d['text'] for d in documents)[:50000]
+            return {'type': 'article', 'engine': 'article', 'text': text, 'documents': documents,
+                    'source_url': info['url'], 'title': article['title'], 'description': article.get('description', ''), 'issues': issues,
+                    'confidence': min(d['confidence'] for d in documents)}
+        except ArticleError as exc:
+            raise IntegrationError(str(exc), 'media_wait' if exc.retryable else 'unsupported_media') from None
 
     def call(self, action, **params):
         python = self.checkout / '.venv/bin/python'
@@ -40,7 +98,7 @@ class WeChat:
             raise IntegrationError('微信数据库读取超时，处理进度已保留，下次将重试') from None
         except (ValueError, OSError):
             raise IntegrationError('微信读取桥未返回有效数据，请保持微信登录') from None
-        if not data.get('ok'): raise IntegrationError(data.get('error', '微信读取失败'))
+        if not data.get('ok'): raise IntegrationError(data.get('error', '微信读取失败'), data.get('code', 'connection'))
         return data['data']
 
     def fingerprint(self):
