@@ -9,8 +9,9 @@ TZ = ZoneInfo('Asia/Shanghai')
 DATE = re.compile(r'(?:(20\d{2})\s*年\s*)?(\d{1,2})\s*月\s*(\d{1,2})\s*[日号]')
 ISO_DATE = re.compile(r'\b(20\d{2})[-/](\d{1,2})[-/](\d{1,2})\b')
 RANGE = re.compile(r'(\d{1,2})\s*[:：]\s*(\d{2})\s*(?:[-—–~～]+|至|到)\s*(\d{1,2})\s*[:：]\s*(\d{2})')
+POINT_LINE = re.compile(r'^(?:时间|开始时间|开始|集合时间|签到时间|安排时间)\s*[:：]?\s*(\d{1,2})\s*[:：]\s*(\d{2})\s*$')
 CHANGE = re.compile(r'取消|改期|改为|调整为|时间调整|地点调整|延期|更正|变更|另行通知')
-HINT = re.compile(r'宣讲|招聘|推介|双选|会议|讲座|报告会|活动|通知|报名|答辩|面试|开会|集合|培训|考试')
+HINT = re.compile(r'宣讲|招聘|推介|双选|会议|讲座|报告会|活动|通知|报名|答辩|面试|开会|集合|培训|考试|安排')
 BOILER = re.compile(r'^(同学们|各位|大家好|请|欢迎|就业办|联系人|电话|国防科大就业|https?://|重要|明[日天].*预告|今[日天].*预告|宣讲会$)')
 ACTION = r'填写|填报|提交|补充(?:完善)?|完善|核对|确认|报名|报送|缴纳|缴费|完成'
 DEADLINE = re.compile(r'截止|截至|最晚|(?:需|须|务必|必须|请|要|应).{0,12}(?:' + ACTION + r')|(?:内|前)(?:完成|提交|填写|填报|报名|报送|缴费)')
@@ -51,6 +52,7 @@ def day_for(line, received):
 
 def tidy_title(line):
     line = re.sub(r'^[\s📢📣!！:：\d、.]+', '', line).strip()
+    line = re.sub(r'^(?:大后天|后天|明天|明日|今天|今日)(?:上午|下午|晚上|晚间)?', '', line).strip()
     return line.rstrip(':：;；。')[:180]
 
 
@@ -133,27 +135,46 @@ def extract(text: str, received=None):
                         date_error = '通知中的日期与星期不一致'
             except ValueError:
                 date_error = '日期无效'; day = None
-        ranges = [(i, m) for i, line in enumerate(block) for m in RANGE.finditer(line)]
+        ranges = [(i, m, 'range') for i, line in enumerate(block) for m in RANGE.finditer(line)]
+        if ranges:
+            time_entries = ranges
+        else:
+            points = []
+            for i, line in enumerate(block):
+                point = POINT_LINE.match(line)
+                if point:
+                    points.append((i, point, 'point'))
+            time_entries = points
         labeled_title = next((re.split(r'[:：]', line, 1)[1].strip() for line in block
                               if re.match(r'^(单位|主办单位|主题|活动名称|会议名称|标题)\s*[:：]', line)), '')
         candidates = [tidy_title(line) for line in block
                       if not (DATE.search(line) or ISO_DATE.search(line) or RANGE.search(line)
                               or re.search(r'时间\s*[:：]|地点\s*[:：]', line) or BOILER.search(line))
-                      and not re.search(r'日程$|安排$|报名方式|参会部门|席位有限|扫码报名|期待.*见', line)
+                      and not re.search(r'^(?:日程|安排)$|报名方式|参会部门|席位有限|扫码报名|期待.*见', line)
                       and (HINT.search(line) or ('专场' in line and len(line) < 60))]
-        if not ranges:
+        if not time_entries:
             if labeled_title or candidates: heading_title = tidy_title(labeled_title) or ' '.join(candidates[:3])[:180]
             continue
         base_title = tidy_title(labeled_title) or heading_title or (candidates[0] if candidates else '')
         heading_title = ''
-        for number, (index, match) in enumerate(ranges):
+        for number, (index, match, time_kind) in enumerate(time_entries):
             reasons = []
             if not day: reasons.append('未识别到明确日期')
             if date_error: reasons.append(date_error)
             if correction: reasons.append('这是一条取消或变更通知，请核对原日程')
             if re.search(r'每周|每月|每年|每天|每星期', normalized):
                 reasons.append('包含重复安排，请在飞书中核对重复规则')
-            h1, m1, h2, m2 = map(int, match.groups())
+            h1, m1 = int(match.group(1)), int(match.group(2))
+            if time_kind == 'range':
+                h2, m2 = int(match.group(3)), int(match.group(4))
+            elif number + 1 < len(time_entries):
+                next_match = time_entries[number + 1][1]
+                h2, m2 = int(next_match.group(1)), int(next_match.group(2))
+            else:
+                h2, m2 = h1, m1 + 30
+                if m2 >= 60:
+                    h2, m2 = h2 + m2 // 60, m2 % 60
+                reasons.append('未提供结束时间，按 30 分钟估算')
             if re.search(r'下午|晚上|晚间', block[index][:match.start()]):
                 if h1 < 12: h1 += 12
                 if h2 < 12: h2 += 12
@@ -180,7 +201,7 @@ def extract(text: str, received=None):
                 reasons.append('未识别到活动名称'); title = role or '待补充活动名称'
             elif labeled_title and not HINT.search(title):
                 title += '招聘宣讲会' if '宣讲' in normalized else '活动'
-            stop = ranges[number + 1][0] if number + 1 < len(ranges) else len(block)
+            stop = time_entries[number + 1][0] if number + 1 < len(time_entries) else len(block)
             near = block[index:stop]
             locations = [re.split(r'[:：]', line, 1)[1].strip() for line in near
                          if re.match(r'^.*?地点\s*[:：]', line)]
@@ -189,8 +210,14 @@ def extract(text: str, received=None):
                              if re.match(r'^(地点|活动地点)\s*[:：]', line)]
             location = locations[0] if locations else ''
             if not location: reasons.append('未识别到地点')
+            audience = ''
+            for line in near:
+                audience_match = re.match(r'^(?:人员|对象|参加人员|参会人员|参会对象|面向)\s*[:：]\s*(.+)$', line)
+                if audience_match:
+                    audience = audience_match.group(1).strip()[:200]
+                    break
             events.append({'title': title, 'start': start, 'end': end, 'location': location,
-                           'description': text[:12000], 'confidence': .97 if not reasons else .5,
+                           'audience': audience, 'description': text[:12000], 'confidence': .97 if not reasons else .5,
                            'reasons': list(dict.fromkeys(reasons)), 'correction': correction})
     if not events:
         deadline = deadline_event(text, normalized, ref)

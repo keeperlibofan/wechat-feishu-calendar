@@ -8,6 +8,7 @@ import time
 import uuid
 from .adapters import IntegrationError, Lark, WeChat, model_config, model_extract
 from .extractor import extract, received_time, validate_event, event_end_time
+from .personalization import audience_decision, normalize_profile, profile_summary
 from .store import Store
 
 
@@ -110,7 +111,8 @@ class App:
         groups = self.db.rows('SELECT * FROM groups ORDER BY created')
         return {'groups': groups, 'events': events, 'issues': issues, 'counts': counts, 'runtime': self.runtime.copy(),
                 'settings': {'interval': self.db.get('interval', 30), 'reminder': self.db.get('reminder', 5),
-                             'model_enabled': self.db.get('model_enabled', False)},
+                             'model_enabled': self.db.get('model_enabled', False),
+                             'profile': normalize_profile(self.db.get('profile', {}))},
                 'jobs': self.jobs, 'timezone': 'Asia/Shanghai', 'primary_calendar_id': self.db.get('primary_calendar_id')}
 
     def analyze(self, text, received=None, use_model=False):
@@ -122,6 +124,16 @@ class App:
         for index, event in enumerate(result['events']):
             event_id = hashlib.sha256((message['id'] + ':' + str(index)).encode()).hexdigest()[:32]
             reasons = list(event.get('reasons', []))
+            profile = normalize_profile(self.db.get('profile', {}))
+            audience = event.get('audience', '')
+            audience_result = audience_decision(audience, profile) if audience else ''
+            if audience_result == 'exclude':
+                continue
+            if audience_result == 'unknown' and audience:
+                reasons.append('通知限定了人员范围，请在个人信息中补充匹配条件')
+            if audience_result == 'match':
+                event['personal_profile_match'] = True
+                reasons = [x for x in reasons if x != '未提供结束时间，按 30 分钟估算']
             if history: reasons.append('历史消息，确认后添加')
             try:
                 validate_event(event)
@@ -134,7 +146,9 @@ class App:
                     if old['event'].get('start', '')[:10] == event.get('start', '')[:10] and event_fingerprint(old['event']) != event_fingerprint(event):
                         reasons.append('已有同名日程，可能是时间或地点变更'); break
             automatic = not history and group.get('enabled') and group.get('mode') == 'auto' and not reasons
-            description = f"来源微信群：{group['name']}\n消息时间：{received_time(message['timestamp']).strftime('%Y-%m-%d %H:%M')}\n\n" + event.get('description', message.get('text', ''))
+            summary = profile_summary(profile)
+            profile_note = f"\n匹配个人条件：{summary}" if event.get('personal_profile_match') and summary else ''
+            description = f"来源微信群：{group['name']}\n消息时间：{received_time(message['timestamp']).strftime('%Y-%m-%d %H:%M')}{profile_note}\n\n" + event.get('description', message.get('text', ''))
             event['description'] = description[:12000]
             self.db.execute('''INSERT OR IGNORE INTO events(id,message_id,group_id,calendar_id,calendar_name,payload,state,reasons,created,updated)
                 VALUES(?,?,?,?,?,?,?,?,?,?)''', (event_id, message['id'], group.get('id'), group['calendar_id'], group['calendar_name'],

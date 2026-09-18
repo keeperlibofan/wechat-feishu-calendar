@@ -348,3 +348,22 @@ def test_http_rejects_cross_site_writes_and_rebinding(app):
         req=urllib.request.Request(root+'/api/settings',data=b'{"interval":60}',headers={'X-App-Token':token})
         assert json.load(urllib.request.urlopen(req))['ok']
     finally:server.shutdown();server.server_close()
+
+
+def test_http_settings_persists_personal_profile(app):
+    server = serve(app, 0)
+    port = server.server_address[1]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    root = f'http://127.0.0.1:{port}'
+    try:
+        token = json.load(urllib.request.urlopen(root + '/api/bootstrap'))['token']
+        body = json.dumps({'interval': 30, 'reminder': 5, 'model_enabled': False,
+                           'profile': {'gender': 'male', 'cohort': '35级', 'tags': '示例关键词, 课题组'}}).encode()
+        req = urllib.request.Request(root + '/api/settings', data=body,
+                                     headers={'X-App-Token': token, 'Content-Type': 'application/json'})
+        assert json.load(urllib.request.urlopen(req))['ok']
+        assert app.db.get('profile') == {'gender': 'male', 'cohort': '2035', 'tags': ['示例关键词', '课题组']}
+        assert app.state()['settings']['profile'] == {'gender': 'male', 'cohort': '2035', 'tags': ['示例关键词', '课题组']}
+    finally:
+        server.shutdown(); server.server_close()

@@ -9,6 +9,7 @@ import secrets
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlsplit
 from .service import App
+from .personalization import normalize_profile
 
 
 def serve(app, port):
@@ -112,7 +113,9 @@ def serve(app, port):
                     if not 15 <= interval <= 600: raise ValueError('检查间隔须在 15–600 秒之间')
                     if reminder not in (0, 5, 10, 15, 30, 60): raise ValueError('请选择有效的提醒时间')
                     app.db.set('interval', interval); app.db.set('reminder', reminder)
-                    app.db.set('model_enabled', bool(data.get('model_enabled', False))); result = {'ok': True}
+                    app.db.set('model_enabled', bool(data.get('model_enabled', False)))
+                    app.db.set('profile', normalize_profile(data.get('profile', app.db.get('profile', {}))))
+                    result = {'ok': True}
                 else: return self.respond({'error': '接口不存在'}, 404)
                 self.respond(result)
             except Exception as exc: self.respond({'error': str(exc)}, 400)
