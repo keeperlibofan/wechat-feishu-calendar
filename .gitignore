@@ -20,3 +20,4 @@ auth.png
 auth.json
 config.local.*
 .DS_Store
+/work/

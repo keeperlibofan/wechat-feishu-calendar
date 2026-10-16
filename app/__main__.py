@@ -112,9 +112,10 @@ def serve(app, port):
                     interval, reminder = int(data.get('interval', 30)), int(data.get('reminder', 5))
                     if not 15 <= interval <= 600: raise ValueError('检查间隔须在 15–600 秒之间')
                     if reminder not in (0, 5, 10, 15, 30, 60): raise ValueError('请选择有效的提醒时间')
+                    profile = normalize_profile(data.get('profile', app.db.get('profile', {})))
                     app.db.set('interval', interval); app.db.set('reminder', reminder)
                     app.db.set('model_enabled', bool(data.get('model_enabled', False)))
-                    app.db.set('profile', normalize_profile(data.get('profile', app.db.get('profile', {}))))
+                    app.db.set('profile', profile)
                     result = {'ok': True}
                 else: return self.respond({'error': '接口不存在'}, 404)
                 self.respond(result)

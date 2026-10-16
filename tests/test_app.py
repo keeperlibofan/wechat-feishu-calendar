@@ -363,7 +363,36 @@ def test_http_settings_persists_personal_profile(app):
         req = urllib.request.Request(root + '/api/settings', data=body,
                                      headers={'X-App-Token': token, 'Content-Type': 'application/json'})
         assert json.load(urllib.request.urlopen(req))['ok']
-        assert app.db.get('profile') == {'gender': 'male', 'cohort': '2035', 'tags': ['示例关键词', '课题组']}
-        assert app.state()['settings']['profile'] == {'gender': 'male', 'cohort': '2035', 'tags': ['示例关键词', '课题组']}
+        stored = app.db.get('profile')
+        assert [a['value'] for a in stored['attributes']] == ['男生', '2035级', '示例关键词, 课题组']
+        assert app.state()['settings']['profile'] == stored
+    finally:
+        server.shutdown(); server.server_close()
+
+
+
+def test_http_custom_profile_roundtrip_and_validation_is_atomic(app):
+    server = serve(app, 0)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    root = f'http://127.0.0.1:{server.server_address[1]}'
+    try:
+        token = json.load(urllib.request.urlopen(root + '/api/bootstrap'))['token']
+        profile = {'attributes': [{'name': '任意新属性', 'type': 'text', 'value': '无需改代码', 'enabled': False},
+                                  {'name': '年龄', 'type': 'number', 'value': '25', 'enabled': True},
+                                  {'name': '出生日期', 'type': 'date', 'value': '2001-02-03', 'enabled': False}],
+                   'introduction': '我负责实验室设备管理。\n有设备维护通知时请提醒我。'}
+        def save(payload):
+            request = urllib.request.Request(root + '/api/settings', data=json.dumps(payload).encode(),
+                                             headers={'X-App-Token': token, 'Content-Type': 'application/json'})
+            return json.load(urllib.request.urlopen(request))
+        assert save({'profile': profile, 'interval': 60})['ok']
+        assert json.load(urllib.request.urlopen(root + '/api/state'))['settings']['profile'] == profile
+        invalid = {'attributes': [{'name': '', 'value': '不能丢失的值'}]}
+        with pytest.raises(urllib.error.HTTPError) as error:
+            save({'profile': invalid, 'interval': 120, 'model_enabled': True})
+        assert error.value.code == 400
+        assert app.db.get('profile') == profile
+        assert app.db.get('interval') == 60
+        assert app.db.get('model_enabled') is False
     finally:
         server.shutdown(); server.server_close()
