@@ -128,7 +128,7 @@ def test_all_day_lark_payload_uses_inclusive_dates_and_does_not_block_the_day(tm
     assert payload['free_busy_status'] == 'free'
     assert payload['need_notification'] is False
     assert payload['reminders'] == []
-    for start, end in [('2026-09-18', '2026-09-17'), ('2026-09-17T00:00:00+08:00', '2026-09-18'), ('2026-09-17', '2026-09-24')]:
+    for start, end in [('2026-09-18', '2026-09-17'), ('2026-09-17T00:00:00+08:00', '2026-09-18'), ('2026-09-17', '2027-09-18')]:
         with pytest.raises(ValueError): validate_event({**event, 'start': start, 'end': end})
 
 

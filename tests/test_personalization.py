@@ -61,7 +61,7 @@ def test_matching_profile_filters_other_group_and_auto_publishes_selected_event(
     assert '已通过个人信息相关性筛选' in events[0]['event']['description']
 
 
-def test_profile_does_not_hide_missing_end_time_without_an_audience(tmp_path):
+def test_default_end_time_is_not_a_blocker_without_an_audience(tmp_path):
     class Source(FakeSource):
         def call(self, action, **params):
             if action == 'groups': return super().call(action, **params)
@@ -76,9 +76,9 @@ def test_profile_does_not_hide_missing_end_time_without_an_audience(tmp_path):
     app.add_group({'id': '123@chatroom', 'calendar_id': 'cal', 'enabled': True})
     app.sync_once(force=True)
     event, = app.db.events()
-    assert event['state'] == 'pending'
-    assert '未提供结束时间，按 30 分钟估算' in event['reasons']
-    assert not app.lark.calls
+    assert event['state'] == 'synced'
+    assert '未提供结束时间，按 30 分钟估算' in event['event']['notes']
+    assert not event['reasons'] and len(app.lark.calls) == 1
 
 
 
@@ -166,13 +166,15 @@ def test_introduction_filters_each_event_after_attributes_and_does_not_leak(tmp_
     assert all([a['name'] for a in c[2]['attributes']] == ['区队'] for c in calls)
     assert events['related']['state'] == 'ready'
     assert 'unrelated' not in events
-    assert events['unsure']['state'] == 'pending'
-    assert '相关性' in events['unsure']['reasons'][0]
+    assert events['unsure']['state'] == 'ready'
+    assert not events['unsure']['reasons']
+    assert any('相关性' in note for note in events['unsure']['event']['notes'])
+    assert not events['unsure']['event'].get('personal_profile_match')
     assert all(profile['introduction'] not in e['event']['description'] and '本机私密姓名' not in e['event']['description'] for e in events.values())
 
 
 @pytest.mark.parametrize('model', [False, True])
-def test_introduction_missing_model_or_failed_model_keeps_candidate(tmp_path, monkeypatch, model):
+def test_introduction_missing_model_or_failed_model_does_not_block(tmp_path, monkeypatch, model):
     app = personal_app(tmp_path, {'introduction': '我负责设备维护。'}, model=model)
     calls = []
     def unavailable(*args):
@@ -181,7 +183,8 @@ def test_introduction_missing_model_or_failed_model_keeps_candidate(tmp_path, mo
     monkeypatch.setattr('app.service.model_relevance', unavailable)
     stage_notice(app, 'waiting')
     event, = app.db.events()
-    assert event['state'] == 'pending'
+    assert event['state'] == 'ready' and not event['reasons']
+    assert event['event']['notes']
     assert len(calls) == int(model)
     assert not app.lark.calls
 

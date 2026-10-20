@@ -123,8 +123,15 @@ class App:
         now = time.time()
         profile = filtering_profile(self.db.get('profile', {}))
         for index, event in enumerate(result['events']):
+            event = dict(event)
             event_id = hashlib.sha256((message['id'] + ':' + str(index)).encode()).hexdigest()[:32]
             reasons = list(event.get('reasons', []))
+            notes = list(event.get('notes', []))
+            # Optional details must not prevent a useful calendar reminder.
+            optional = {'未识别到地点': '地点尚未识别，先按原通知时间收录',
+                        '未提供结束时间，按 30 分钟估算': '未提供结束时间，按 30 分钟估算'}
+            notes.extend(optional[reason] for reason in reasons if reason in optional)
+            reasons = [reason for reason in reasons if reason not in optional]
             audience = event.get('audience', '')
             audience_result = audience_decision(audience, profile) if audience else ''
             if audience_result == 'exclude':
@@ -136,16 +143,16 @@ class App:
                     semantic_result = model_relevance(event, message.get('text') or event.get('description', ''), profile, message['timestamp'])
                 except Exception:
                     semantic_result = 'unknown'
+                    notes.append('模型相关性判断暂不可用，按不漏记原则收录')
                 if semantic_result == 'exclude': continue
-                if semantic_result == 'unknown': reasons.append('个人信息相关性尚不能确定，请核对后添加')
+                if semantic_result == 'unknown': notes.append('个人信息相关性尚不明确，按不漏记原则收录')
             elif profile['introduction']:
                 semantic_result = 'unknown'
-                reasons.append('个人介绍尚未参与相关性判断，请启用模型辅助或手动确认')
+                notes.append('未启用模型语义筛选，按不漏记原则收录')
             if audience_result == 'unknown' and audience and semantic_result != 'match':
-                reasons.append('通知限定了人员范围，请在个人信息中补充匹配条件')
+                notes.append('人员条件未完全匹配，按不漏记原则收录')
             if (audience_result == 'match' or semantic_result == 'match') and semantic_result != 'unknown':
                 event['personal_profile_match'] = True
-                if audience: reasons = [x for x in reasons if x != '未提供结束时间，按 30 分钟估算']
             if history: reasons.append('历史消息，确认后添加')
             try:
                 validate_event(event)
@@ -159,7 +166,10 @@ class App:
                         reasons.append('已有同名日程，可能是时间或地点变更'); break
             automatic = not history and group.get('enabled') and group.get('mode') == 'auto' and not reasons
             profile_note = '\n已通过个人信息相关性筛选' if event.get('personal_profile_match') else ''
+            event['notes'] = list(dict.fromkeys(notes))
+            event['reasons'] = list(dict.fromkeys(reasons))
             description = f"来源微信群：{group['name']}\n消息时间：{received_time(message['timestamp']).strftime('%Y-%m-%d %H:%M')}{profile_note}\n\n" + event.get('description', message.get('text', ''))
+            if event['notes']: description += '\n\n自动处理说明：\n' + '\n'.join(event['notes'])
             event['description'] = description[:12000]
             self.db.execute('''INSERT OR IGNORE INTO events(id,message_id,group_id,calendar_id,calendar_name,payload,state,reasons,created,updated)
                 VALUES(?,?,?,?,?,?,?,?,?,?)''', (event_id, message['id'], group.get('id'), group['calendar_id'], group['calendar_name'],
