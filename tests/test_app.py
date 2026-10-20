@@ -128,8 +128,17 @@ def test_all_day_lark_payload_uses_inclusive_dates_and_does_not_block_the_day(tm
     assert payload['free_busy_status'] == 'free'
     assert payload['need_notification'] is False
     assert payload['reminders'] == []
+    assert 'location' not in payload
     for start, end in [('2026-09-18', '2026-09-17'), ('2026-09-17T00:00:00+08:00', '2026-09-18'), ('2026-09-17', '2027-09-18')]:
         with pytest.raises(ValueError): validate_event({**event, 'start': start, 'end': end})
+
+
+@pytest.mark.parametrize('location', ['', '示例会议室'])
+def test_timed_lark_payload_only_sends_a_nonempty_location(tmp_path, location):
+    event = extract(NOTICE, '2026-09-15T22:00:00+08:00')['events'][0]
+    payload = Lark(tmp_path).payload({**event, 'location': location})
+    if location: assert payload['location'] == {'name': location}
+    else: assert 'location' not in payload
 
 
 class FakeSource:
